@@ -35,25 +35,84 @@ if S3PRL_PATH not in sys.path:
 ######################
 def get_upstream_args():
     
-    parser = argparse.ArgumentParser(description='Argument Parser for Upstream Models of the S3PLR project.')
+    parser = argparse.ArgumentParser(
+        description='Argument Parser for Upstream Models of the S3PLR project.'
+    )
 
     # required
-    parser.add_argument('--run',  choices=['transformer', 'apc'], help='Select pre-training task. \
-                        For the transformer models, which type of pre-training (mockingjay, tera, aalbert, etc) \
-                        is determined by config file.', required=True)
-    parser.add_argument('--config', type=str, help='Path to experiment config.', required=True)
+    parser.add_argument(
+        '--run',
+        choices=['transformer', 'apc'],
+        help='Select pre-training task. \
+            For the transformer models, which type of pre-training (mockingjay, tera, aalbert, etc) \
+            is determined by config file.',
+            required=True
+    )
+    parser.add_argument(
+        '--config',
+        type=str,
+        help='Path to experiment config.',
+        required=True
+    )
 
     # ckpt and logging
-    parser.add_argument('--name', default=None, type=str, help='Name for logging.', required=False)
-    parser.add_argument('--ckpdir', default='', type=str, help='Path to store checkpoint result, if empty then default is used.', required=False)
-    parser.add_argument('--seed', default=1337, type=int, help='Random seed for reproducable results.', required=False)
+    parser.add_argument(
+        '--name',
+        default=None,
+        type=str,
+        help='Name for logging.', required=False
+    )
+    parser.add_argument(
+        '--ckpdir',
+        default='',
+        type=str,
+        help='Path to store checkpoint result, if empty then default is used.',
+        required=False
+    )
+    parser.add_argument(
+        '--seed',
+        default=1337,
+        type=int,
+        help='Random seed for reproducable results.',
+        required=False
+    )
     
     # Options
-    parser.add_argument('--test', default='', type=str, help='Input path to the saved model ckpt for testing.')
-    parser.add_argument('--cpu', action='store_true', help='Disable GPU training.')
-    parser.add_argument('--multi_gpu', action='store_true', help='Enable Multi-GPU training.')
-    parser.add_argument('--test_reconstruct', action='store_true', help='Test reconstruction capability')
-    parser.add_argument('--online_config', help='Explicitly specify the config of on-the-fly feature extraction')
+    parser.add_argument(
+        '--test',
+        default='',
+        type=str,
+        help='Input path to the saved model ckpt for testing.'
+    )
+    parser.add_argument(
+        '--cpu',
+        action='store_true',
+        help='Disable GPU training.'
+    )
+    parser.add_argument(
+        '--multi_gpu',
+        action='store_true',
+        help='Enable Multi-GPU training.'
+    )
+    parser.add_argument(
+        '--test_reconstruct',
+        action='store_true',
+        help='Test reconstruction capability'
+    )
+    parser.add_argument(
+        '--test_mam',
+        action='store_true',
+        help='Test MAM reconstruction capability'
+    )
+    parser.add_argument(
+        '--online_config',
+        help='Explicitly specify the config of on-the-fly feature extraction'
+    )
+    parser.add_argument(
+        '--reinitialize',
+        action='store_true',
+        help='Reinitialize saved model'
+    )
     parser.add_argument('--kaldi_data', action='store_true', help='Whether to use the Kaldi dataset')
 
     # parse
@@ -71,21 +130,29 @@ def get_upstream_args():
 ##################
 # GET DATALOADER #
 ##################
-def get_dataloader(args, config):
+def get_dataloader(args, config, split='train'):
     
     if not os.path.exists(config['dataloader']['data_path']):
-        raise RuntimeError('[run_upstream] - Data path not valid:', config['dataloader']['data_path'])
-    print('[run_upstream] - Loading input data: ' + str(config['dataloader']['train_set']) + ' from ' + config['dataloader']['data_path'])
+        raise RuntimeError('[run_upstream] - \
+            Data path not valid:', config['dataloader']['data_path'])
+    print('[run_upstream] - Loading input data: '
+        + str(config['dataloader']['train_set']) + ' from '
+        + config['dataloader']['data_path'])
     print('[run_upstream] - getting train dataloader...')
 
     load = 'duo' if bool(config['runner']['duo_feature']) else 'kaldi' if args.kaldi_data else 'acoustic'
     if load == 'duo': 
-        print('[run_upstream] - Loading duo data: ' + str(config['dataloader']['train_set']) + ' from ' + config['dataloader']['target_path'])
+        print('[run_upstream] - Loading duo data: '
+            + str(config['dataloader']['train_set']) + ' from '
+            + config['dataloader']['target_path'])
     if load == 'kaldi':
         print('[run_upstream] - Loading Kaldi data: ' + str(config['dataloader']['data_path']) + ' from these sets ' + str(config['dataloader']['train_set']))
     
-    dataloader = get_Dataloader(split='train', load=load, use_gpu=args.gpu, 
-                                run_mam=True, mam_config=config['transformer'], **config['dataloader'])
+    dataloader = get_Dataloader(
+        split=split, load=load, use_gpu=args.gpu, 
+        run_mam=True, mam_config=config['transformer'],
+        **config['dataloader']
+    )
 
     return dataloader
 
@@ -117,8 +184,30 @@ def run_transformer(args, config):
     # train
     runner = Runner(args, config, dataloader, ckpdir)
     runner.set_model()
+    runner.load_model()
     runner.train()
 
+def test_mam(args, config):
+    from transformer.runner import Runner
+
+    # mkdir
+    if args.ckpdir == '':
+        if args.name is None: args.name = 'run_' + str(random.randint(0, 999))
+        ckpdir = os.path.join('result/result_transformer/', args.name)
+    else:
+        ckpdir = args.ckpdir
+    if not os.path.exists(ckpdir):
+        os.makedirs(ckpdir)
+    copyfile(args.config, os.path.join(ckpdir, args.config.split('/')[-1]))
+
+    # get dataloader
+    dataloader = get_dataloader(args, config, split='test')
+
+    # train
+    runner = Runner(args, config, dataloader, ckpdir)
+    runner.set_model()
+    runner.load_model()
+    runner.test()
 
 ####################
 # TEST TRANSFORMER #
@@ -138,6 +227,26 @@ def test_transformer(args, input_dim):
     print('[upstream runner] - successfully loaded, valid checkpoint: ', args.test)
     return upstream_model
 
+def reinitialize(args, config):
+    from transformer.runner import Runner
+
+    if args.ckpdir == '':
+        if args.name is None: args.name = 'run_' + str(random.randint(0, 999))
+        ckpdir = os.path.join('result/result_transformer/', args.name)
+    else:
+        ckpdir = args.ckpdir
+    if not os.path.exists(ckpdir):
+        os.makedirs(ckpdir)
+    copyfile(args.config, os.path.join(ckpdir, args.config.split('/')[-1]))
+
+    # get dataloader
+    dataloader = get_dataloader(args, config)
+
+    # train
+    runner = Runner(args, config, dataloader, ckpdir)
+    runner.set_model()
+    runner.load_only_transformer()
+    runner.save_model()
 
 ###########
 # RUN APC #
@@ -155,7 +264,6 @@ def main():
     
     # get arguments
     args, config = get_upstream_args()
-    
     # Fix seed and make backends deterministic
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -168,6 +276,10 @@ def main():
     if args.run == 'transformer':
         if args.test != '':
             test_transformer(args, config['transformer']['input_dim'])
+        elif args.reinitialize:
+            reinitialize(args, config)
+        elif args.test_mam:
+            test_mam(args, config)
         else:
             run_transformer(args, config)
 

@@ -11,6 +11,7 @@
 # IMPORTATION #
 ###############
 import os
+import glob
 import math
 import torch
 import random
@@ -21,7 +22,7 @@ from transformer.model import TransformerConfig, TransformerForMaskedAcousticMod
 from transformer.model_dual import DualTransformerConfig, DualTransformerForMaskedAcousticModel
 from transformer.optimization import BertAdam, Lamb, WarmupLinearSchedule
 from transformer.mam import fast_position_encoding
-from utility.audio import plot_spectrogram_to_numpy
+from utility.audio import plot_spectrogram_to_numpy, plot_spectrogram
 from transformer.mam import process_train_MAM_data
 from utility.preprocessor import OnlinePreprocessor
 
@@ -32,7 +33,7 @@ from utility.preprocessor import OnlinePreprocessor
 class Runner():
     ''' Handler for complete pre-training progress of upstream models '''
     def __init__(self, args, config, dataloader, ckpdir):
-        
+
         self.device = torch.device('cuda') if (args.gpu and torch.cuda.is_available()) else torch.device('cpu')
         if torch.cuda.is_available(): print('[Runner] - CUDA is available!')
         self.model_kept = []
@@ -72,17 +73,88 @@ class Runner():
             self.input_dim = self.transformer_config['input_dim']
             self.output_dim = 1025 if self.duo_feature else None # output dim is the same as input dim if not using duo features
 
+    def verbose(self, msg, end='\n'):
+        ''' Verbose function for print information to stdout'''
+        print('[RUNNER] - ', msg, end=end)
+
+
+    def load_only_transformer(self, from_path=None):
+        if from_path is None:
+            list_of_ckpts = glob.glob('{}/*.ckpt'.format(self.ckpdir))
+            if len(list_of_ckpts) > 0:
+                from_path = max(list_of_ckpts, key=os.path.getctime)
+        if from_path is None:
+            return
+
+        self.verbose('Load model from {}'.format(from_path))
+        all_states = torch.load(from_path, map_location='cpu')
+        self.load_model_list = ['SpecHead', 'Transformer']
+        self.load_utility(all_states)
+
+
+    def load_model(self, from_path=None):
+        if from_path is None:
+            list_of_ckpts = glob.glob('{}/*.ckpt'.format(self.ckpdir))
+            if len(list_of_ckpts) > 0:
+                from_path = max(list_of_ckpts, key=os.path.getctime)
+        if from_path is None:
+            return
+
+        self.verbose('Load model from {}'.format(from_path))
+        all_states = torch.load(from_path, map_location='cpu')
+        self.load_model_list = ['SpecHead', 'Transformer', 'Optimizer', 'Global_step']
+        self.load_utility(all_states)
+
+
+    def load_utility(self, all_states):
+
+        if 'SpecHead' in self.load_model_list:
+            try:
+                if not self.args.multi_gpu:
+                    self.model.SpecHead.load_state_dict(all_states['SpecHead'])
+                else:
+                    self.model.module.SpecHead.load_state_dict(all_states['SpecHead'])
+                self.verbose('[SpecHead] - Loaded')
+            except: self.verbose('[SpecHead - X]')
+
+        if 'Transformer' in self.load_model_list:
+            try:
+                state_dict = all_states['Transformer']
+
+                # perform load
+                if not self.args.multi_gpu:
+                    self.model.Transformer.load_state_dict(state_dict)
+                else:
+                    self.model.Transformer.module.load_state_dict(state_dict)
+                self.verbose('[Transformer] - Loaded')
+            except: self.verbose('[Transformer - X]')
+
+        if 'Optimizer' in self.load_model_list:
+            try:
+                self.optimizer.load_state_dict(all_states['Optimizer'])
+                for state in self.optimizer.state.values():
+                    for k, v in state.items():
+                        if torch.is_tensor(v):
+                            state[k] = v.cuda()
+                self.verbose('[Optimizer] - Loaded')
+            except: self.verbose('[Optimizer - X]')
+
+        if 'Global_step' in self.load_model_list:
+            try:
+                self.global_step = all_states['Global_step']
+                self.verbose('[Global_step: {}] - Loaded'.format(self.global_step))
+            except: self.verbose('[Global_step - X]')
+
+        self.verbose('Model loading complete!')
+
+
+
 
     def set_model(self):
         # build the Transformer model with speech prediction head
-        if self.dual_transformer:
-            print('[Runner] - Initializing Dual Transformer model...')
-            model_config = DualTransformerConfig(self.config)
-            self.model = DualTransformerForMaskedAcousticModel(model_config, self.input_dim, self.output_dim).to(self.device)
-        else:
-            print('[Runner] - Initializing Transformer model...')
-            model_config = TransformerConfig(self.config)
-            self.model = TransformerForMaskedAcousticModel(model_config, self.input_dim, self.output_dim).to(self.device)
+        print('[Runner] - Initializing Transformer model...')
+        model_config = TransformerConfig(self.config)
+        self.model = TransformerForMaskedAcousticModel(model_config, self.input_dim, self.output_dim).to(self.device)
         self.model.train()
 
         if self.args.multi_gpu:
@@ -137,30 +209,18 @@ class Runner():
             raise NotImplementedError()
 
 
-    def save_model(self, name='states', to_path=None):
-        if self.dual_transformer:
-            all_states = { 'SpecHead': self.model.SpecHead.state_dict() if not self.args.multi_gpu else self.model.module.SpecHead.state_dict() }
-            if hasattr(self.model, 'SpecTransformer'):
-                all_states['SpecTransformer'] = self.model.SpecTransformer.state_dict() if not self.args.multi_gpu else self.model.module.SpecTransformer.state_dict()
-            if hasattr(self.model, 'SPE'):
-                all_states['SPE'] = self.model.SPE if not self.args.multi_gpu else self.model.module.SPE
-            if hasattr(self.model, 'PhoneticTransformer'): 
-                all_states['PhoneticTransformer'] = self.model.PhoneticTransformer.Transformer.state_dict() if not self.args.multi_gpu else self.model.module.PhoneticTransformer.Transformer.state_dict()
-            if hasattr(self.model.PhoneticTransformer, 'PhoneRecognizer'): 
-                all_states['PhoneticLayer'] = self.model.PhoneticTransformer.PhoneRecognizer.state_dict() if not self.args.multi_gpu else self.model.module.PhoneticTransformer.PhoneRecognizer.state_dict()
-            if hasattr(self.model, 'SpeakerTransformer'): 
-                all_states['SpeakerTransformer'] = self.model.SpeakerTransformer.Transformer.state_dict() if not self.args.multi_gpu else self.model.module.SpeakerTransformer.Transformer.state_dict()
-            if hasattr(self.model.SpeakerTransformer, 'SpeakerRecognizer'): 
-                all_states['SpeakerLayer'] = self.model.SpeakerTransformer.SpeakerRecognizer.state_dict() if not self.args.multi_gpu else self.model.module.SpeakerTransformer.SpeakerRecognizer.state_dict()
-        else:
-            all_states = {
-                'SpecHead': self.model.SpecHead.state_dict() if not self.args.multi_gpu else self.model.module.SpecHead.state_dict(),
-                'Transformer': self.model.Transformer.state_dict() if not self.args.multi_gpu else self.model.module.Transformer.state_dict(),
-            }
 
-        all_states['Optimizer'] = self.optimizer.state_dict()
-        all_states['Global_step'] = self.global_step
-        all_states['Settings'] = { 'Config': self.config, 'Paras': self.args }
+    def save_model(self, name='states', to_path=None):
+        all_states = {
+            'SpecHead': self.model.SpecHead.state_dict() if not self.args.multi_gpu else self.model.module.SpecHead.state_dict(),
+            'Transformer': self.model.Transformer.state_dict() if not self.args.multi_gpu else self.model.module.Transformer.state_dict(),
+            'Optimizer': self.optimizer.state_dict(),
+            'Global_step': self.global_step,
+            'Settings': {
+                'Config': self.config,
+                'Paras': self.args,
+            },
+        }
 
         if to_path is None:
             new_model_path = '{}/{}-{}.ckpt'.format(self.ckpdir, name, self.global_step)
@@ -176,7 +236,7 @@ class Runner():
 
 
     def up_sample_frames(self, spec, return_first=False):
-        if len(spec.shape) != 3: 
+        if len(spec.shape) != 3:
             spec = spec.unsqueeze(0)
             assert(len(spec.shape) == 3), 'Input should have acoustic feature of shape BxTxD'
         # spec shape: [batch_size, sequence_length // downsample_rate, output_dim * downsample_rate]
@@ -195,7 +255,7 @@ class Runner():
     def process_data(self, spec):
         """Process training data for the masked acoustic model"""
         with torch.no_grad():
-            
+
             assert(len(spec) == 5), 'dataloader should return (spec_masked, pos_enc, mask_label, attn_mask, spec_stacked)'
             # Unpack and Hack bucket: Bucketing should cause acoustic feature to have shape 1xBxTxD'
             spec_masked = spec[0].squeeze(0)
@@ -219,41 +279,58 @@ class Runner():
 
         return spec_masked, pos_enc, mask_label, attn_mask, spec_stacked # (x, pos_enc, mask_label, attention_mask. y)
 
-
-    def process_dual_data(self, spec):
-        """Process training data for the dual masked acoustic model"""
+    def test(self):
+        progress = tqdm(self.dataloader, desc="Iteration")
+        step = 0
+        loss_val = 0
         with torch.no_grad():
-            
-            assert(len(spec) == 6), 'dataloader should return (time_masked, freq_masked, pos_enc, mask_label, attn_mask, spec_stacked)'
-            # Unpack and Hack bucket: Bucketing should cause acoustic feature to have shape 1xBxTxD'
-            time_masked = spec[0].squeeze(0)
-            freq_masked = spec[1].squeeze(0)
-            pos_enc = spec[2].squeeze(0)
-            mask_label = spec[3].squeeze(0)
-            attn_mask = spec[4].squeeze(0)
-            spec_stacked = spec[5].squeeze(0)
+            self.model.eval()
+            for batch_is_valid, *batch in progress:
+                try:
+                    if not batch_is_valid: continue
+                    spec_masked, pos_enc, mask_label, attn_mask, spec_stacked = self.process_data(batch)
+                    loss, pred_spec = self.model(spec_masked, pos_enc, mask_label, attn_mask, spec_stacked)
+                    step += 1
 
-            time_masked = time_masked.to(device=self.device)
-            freq_masked = freq_masked.to(device=self.device)
-            if pos_enc.dim() == 3:
-                # pos_enc: (batch_size, seq_len, hidden_size)
-                # GPU memory need (batch_size * seq_len * hidden_size)
-                pos_enc = pos_enc.float().to(device=self.device)
-            elif pos_enc.dim() == 2:
-                # pos_enc: (seq_len, hidden_size)
-                # GPU memory only need (seq_len * hidden_size) even after expanded
-                pos_enc = pos_enc.float().to(device=self.device).expand(time_masked.size(0), *pos_enc.size())
-            mask_label = mask_label.bool().to(device=self.device)
-            attn_mask = attn_mask.float().to(device=self.device)
-            spec_stacked = spec_stacked.to(device=self.device)
+                    # Accumulate Loss
+                    loss_val += loss.item()
 
-        return time_masked, freq_masked, pos_enc, mask_label, attn_mask, spec_stacked # (x, pos_enc, mask_label, attention_mask. y)
+                    # Update
+                    if (step+1) % self.log_step == 0:
+                        # Log
+                        #self.log.add_scalar('lr', self.optimizer.get_lr()[0], self.global_step)
+                        print('loss', loss_val / step)
 
+                    if (step + 1) % self.log_step == 0:
+                        mask_spec = self.up_sample_frames(spec_masked[0], return_first=True)
+                        pred_spec = self.up_sample_frames(pred_spec[0], return_first=True)
+                        true_spec = self.up_sample_frames(spec_stacked[0], return_first=True)
+                        mask_path = '{}/imgs/mask-{}.png'.format(self.ckpdir, step)
+                        true_path = '{}/imgs/true-{}.png'.format(self.ckpdir, step)
+                        pred_path = '{}/imgs/pred-{}.png'.format(self.ckpdir, step)
+                        mask_spec = plot_spectrogram(mask_spec.data.cpu().numpy(), mask_path)
+                        pred_spec = plot_spectrogram(pred_spec.data.cpu().numpy(), pred_path)
+                        true_spec = plot_spectrogram(true_spec.data.cpu().numpy(), true_path)
+
+                except RuntimeError as e:
+                    if 'CUDA out of memory' in str(e):
+                        print('CUDA out of memory at step: ', self.global_step)
+                        torch.cuda.empty_cache()
+                        self.optimizer.zero_grad()
+                    else:
+                        raise
+        self.log.close()
 
     def train(self):
         ''' Self-Supervised Pre-Training of Transformer Model'''
 
         pbar = tqdm(total=self.total_steps)
+        skip_steps = self.global_step * self.gradient_accumulation_steps
+        cur_step = 0
+        # While resuming, we donot skip over the dataloader.
+        # We instead have random seed set everytime. This means
+        # for large number of epochs we will see every datapoint
+        # same number of times. Otherwise this is not good.
         while self.global_step <= self.total_steps:
 
             progress = tqdm(self.dataloader, desc="Iteration")
@@ -272,14 +349,13 @@ class Runner():
                     if self.global_step > self.total_steps: break
                     if not batch_is_valid: continue
                     step += 1
-                    
-                    if self.dual_transformer:
-                        time_masked, freq_masked, pos_enc, mask_label, attn_mask, spec_stacked = self.process_dual_data(batch)
-                        loss, pred_spec = self.model(time_masked, freq_masked, pos_enc, mask_label, attn_mask, spec_stacked)
-                    else:
-                        spec_masked, pos_enc, mask_label, attn_mask, spec_stacked = self.process_data(batch)
-                        loss, pred_spec = self.model(spec_masked, pos_enc, mask_label, attn_mask, spec_stacked)
-                    
+                    # Skip till global step
+                    cur_step += 1
+                    if cur_step <= skip_steps:
+                        continue
+                    spec_masked, pos_enc, mask_label, attn_mask, spec_stacked = self.process_data(batch)
+                    loss, pred_spec = self.model(spec_masked, pos_enc, mask_label, attn_mask, spec_stacked)
+
                     # Accumulate Loss
                     if self.gradient_accumulation_steps > 1:
                         loss = loss / self.gradient_accumulation_steps
@@ -302,7 +378,7 @@ class Runner():
                             lr_this_step = self.learning_rate * self.warmup_linear.get_lr(self.global_step, self.warmup_proportion)
                             for param_group in self.optimizer.param_groups:
                                 param_group['lr'] = lr_this_step
-                        
+
                         # Step
                         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
                         if math.isnan(grad_norm):
@@ -310,7 +386,6 @@ class Runner():
                         else:
                             self.optimizer.step()
                         self.optimizer.zero_grad()
-
                         if self.global_step % self.log_step == 0:
                             # Log
                             self.log.add_scalar('lr', self.optimizer.get_lr()[0], self.global_step)
@@ -320,15 +395,9 @@ class Runner():
 
                         if self.global_step % self.save_step == 0:
                             self.save_model('states')
-                            
                             # tensorboard log
-                            if self.dual_transformer: spec_masked = time_masked
                             spec_list = [spec_masked, pred_spec, spec_stacked]
                             name_list = ['mask_spec', 'pred_spec', 'true_spec']
-                            if self.dual_transformer: 
-                                spec_list.insert(1, freq_masked)
-                                name_list.insert(1, 'mask_freq')
-                                name_list[0] = 'mask_time'
                             
                             for i in range(len(spec_list)):
                                 spec = self.up_sample_frames(spec_list[i][0], return_first=True)
@@ -341,7 +410,6 @@ class Runner():
                         loss_val = 0
                         pbar.update(1)
                         self.global_step += 1
-                        
                 except RuntimeError as e:
                     if 'CUDA out of memory' in str(e):
                         print('CUDA out of memory at step: ', self.global_step)
@@ -349,6 +417,5 @@ class Runner():
                         self.optimizer.zero_grad()
                     else:
                         raise
-                
         pbar.close()
         self.log.close()

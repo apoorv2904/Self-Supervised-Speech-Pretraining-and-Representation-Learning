@@ -75,54 +75,62 @@ class TransformerBaseWrapper(nn.Module):
             self.weight = nn.Parameter(torch.ones(self.num_layers) / self.num_layers)
 
 
-    def load_model(self, transformer_model, state_dict):
-        try:
-            old_keys = []
-            new_keys = []
-            for key in state_dict.keys():
-                new_key = None
-                if 'gamma' in key:
-                    new_key = key.replace('gamma', 'weight')
-                if 'beta' in key:
-                    new_key = key.replace('beta', 'bias')
-                if new_key:
-                    old_keys.append(key)
-                    new_keys.append(new_key)
-            for old_key, new_key in zip(old_keys, new_keys):
-                state_dict[new_key] = state_dict.pop(old_key)
+    def load_model(self, state_dict):
+            try:
+                # perform load
+                self.model.load_state_dict(state_dict)
+                print('[Transformer] - Loaded')
+            except: print('[Transformer - X]')
 
-            missing_keys = []
-            unexpected_keys = []
-            error_msgs = []
-            # copy state_dict so _load_from_state_dict can modify it
-            metadata = getattr(state_dict, '_metadata', None)
-            state_dict = state_dict.copy()
-            if metadata is not None:
-                state_dict._metadata = metadata
 
-            def load(module, prefix=''):
-                local_metadata = {} if metadata is None else metadata.get(prefix[:-1], {})
-                module._load_from_state_dict(
-                    state_dict, prefix, local_metadata, True, missing_keys, unexpected_keys, error_msgs)
-                for name, child in module._modules.items():
-                    if child is not None:
-                        load(child, prefix + name + '.')
+    # def load_model(self, transformer_model, state_dict):
+    #     try:
+    #         old_keys = []
+    #         new_keys = []
+    #         for key in state_dict.keys():
+    #             new_key = None
+    #             if 'gamma' in key:
+    #                 new_key = key.replace('gamma', 'weight')
+    #             if 'beta' in key:
+    #                 new_key = key.replace('beta', 'bias')
+    #             if new_key:
+    #                 old_keys.append(key)
+    #                 new_keys.append(new_key)
+    #         for old_key, new_key in zip(old_keys, new_keys):
+    #             state_dict[new_key] = state_dict.pop(old_key)
 
-            load(transformer_model)
-            if len(missing_keys) > 0:
-                print('Weights of {} not initialized from pretrained model: {}'.format(
-                    transformer_model.__class__.__name__, missing_keys))
-            if len(unexpected_keys) > 0:
-                print('Weights from pretrained model not used in {}: {}'.format(
-                    transformer_model.__class__.__name__, unexpected_keys))
-            if len(error_msgs) > 0:
-                raise RuntimeError('Error(s) in loading state_dict for {}:\n\t{}'.format(
-                                    transformer_model.__class__.__name__, '\n\t'.join(error_msgs)))
-            print('[Transformer] - Pre-trained weights loaded!')
-            return transformer_model
+    #         missing_keys = []
+    #         unexpected_keys = []
+    #         error_msgs = []
+    #         # copy state_dict so _load_from_state_dict can modify it
+    #         metadata = getattr(state_dict, '_metadata', None)
+    #         state_dict = state_dict.copy()
+    #         if metadata is not None:
+    #             state_dict._metadata = metadata
 
-        except: 
-            raise RuntimeError('[Transformer] - Pre-trained weights NOT loaded!')
+    #         def load(module, prefix=''):
+    #             local_metadata = {} if metadata is None else metadata.get(prefix[:-1], {})
+    #             module._load_from_state_dict(
+    #                 state_dict, prefix, local_metadata, True, missing_keys, unexpected_keys, error_msgs)
+    #             for name, child in module._modules.items():
+    #                 if child is not None:
+    #                     load(child, prefix + name + '.')
+
+    #         load(transformer_model)
+    #         if len(missing_keys) > 0:
+    #             print('Weights of {} not initialized from pretrained model: {}'.format(
+    #                 transformer_model.__class__.__name__, missing_keys))
+    #         if len(unexpected_keys) > 0:
+    #             print('Weights from pretrained model not used in {}: {}'.format(
+    #                 transformer_model.__class__.__name__, unexpected_keys))
+    #         if len(error_msgs) > 0:
+    #             raise RuntimeError('Error(s) in loading state_dict for {}:\n\t{}'.format(
+    #                                 transformer_model.__class__.__name__, '\n\t'.join(error_msgs)))
+    #         print('[Transformer] - Pre-trained weights loaded!')
+    #         return transformer_model
+
+    #     except: 
+    #         raise RuntimeError('[Transformer] - Pre-trained weights NOT loaded!')
 
     def get_preprocessor(self, online_config):
         # load the same preprocessor as pretraining stage
@@ -323,7 +331,6 @@ class TRANSFORMER(TransformerBaseWrapper):
             x = self._forward(x)
         return x
 
-
 ####################
 # SPEC TRANSFORMER #
 ####################
@@ -353,81 +360,6 @@ class SPEC_TRANSFORMER(TRANSFORMER):
             x = self._forward(x)
             x, _ = self.SpecHead(x)
         return x
-
-
-####################
-# DUAL TRANSFORMER #
-####################
-class DUAL_TRANSFORMER(TransformerBaseWrapper):
-    def __init__(self, options, inp_dim, config=None, mode='phone', with_recognizer=True):
-        super(DUAL_TRANSFORMER, self).__init__(options, inp_dim, config)
-
-        del self.model_config
-        self.model_config = DualTransformerConfig(self.config)
-        self.out_dim = 0 # This attribute is necessary, for pytorch-kaldi and run_downstream.py
-        self.mode = mode # can be 'phone', 'speaker', or 'phone speaker'
-        assert self.mode in 'phone speaker'
-        
-        # Build model
-        if 'phone' in self.mode:
-            self.PhoneticTransformer = TransformerPhoneticEncoder(self.model_config, self.inp_dim, with_recognizer=with_recognizer).to(self.device)
-            self.PhoneticTransformer.eval() if self.no_grad else self.PhoneticTransformer.train()
-            self.model = self.PhoneticTransformer
-        
-        if 'speaker' in self.mode:
-            self.SpeakerTransformer = TransformerSpeakerEncoder(self.model_config, self.inp_dim, with_recognizer=with_recognizer).to(self.device)
-            self.SpeakerTransformer.eval() if self.no_grad else self.SpeakerTransformer.train()
-            self.model = self.SpeakerTransformer
-        
-        # Load from a PyTorch state_dict
-        load = bool(strtobool(options["load_pretrain"]))
-        if load and 'phone' in self.mode:
-            self.PhoneticTransformer.Transformer = self.load_model(self.PhoneticTransformer.Transformer, 
-                                                                   self.all_states['PhoneticTransformer'])
-            if hasattr(self.PhoneticTransformer, 'PhoneRecognizer'): 
-                self.PhoneticTransformer.PhoneRecognizer.load_state_dict(self.all_states['PhoneticLayer'])
-            self.out_dim += self.PhoneticTransformer.out_dim
-            print('[Phonetic Transformer] - Number of parameters: ' + str(sum(p.numel() for p in self.PhoneticTransformer.parameters() if p.requires_grad)))
-
-        if load and 'speaker' in self.mode:
-            self.SpeakerTransformer.Transformer = self.load_model(self.SpeakerTransformer.Transformer, 
-                                                                   self.all_states['SpeakerTransformer'])
-            if hasattr(self.SpeakerTransformer, 'SpeakerRecognizer'):
-                self.SpeakerTransformer.SpeakerRecognizer.load_state_dict(self.all_states['SpeakerLayer'])
-            self.out_dim += self.SpeakerTransformer.out_dim
-            print('[Speaker Transformer] - Number of parameters: ' + str(sum(p.numel() for p in self.SpeakerTransformer.parameters() if p.requires_grad)))
-
-
-    def _dual_forward(self, x):
-        if 'phone' in self.mode and 'speaker' in self.mode:
-            self.model = self.PhoneticTransformer
-            phonetic_code = self._forward(copy.deepcopy(x))
-            self.model = self.SpeakerTransformer
-            speaker_code = self._forward(x)
-            if self.model_config.average_pooling: 
-                speaker_code = speaker_code.repeat(1, phonetic_code.size(1), 1)
-            if self.model_config.combine == 'concat':
-                x = torch.cat((phonetic_code, speaker_code), dim=2)
-            elif self.model_config.combine == 'add':
-                x = phonetic_code + speaker_code
-            else:
-                raise NotImplementedError
-
-        elif ('phone' in self.mode) != ('speaker' in self.mode): # exclusive or
-            x = self._forward(x)
-        else:
-            raise NotImplementedError
-        return x
-
-
-    def forward(self, x):
-        if self.no_grad:
-            with torch.no_grad():
-                x = self._dual_forward(x)
-        else:
-            x = self._dual_forward(x)
-        return x
-
 
 #######################
 # POSITIONAL ENCODING #
